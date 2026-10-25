@@ -32,6 +32,7 @@ except ImportError:  # mcp 1.x
     from mcp.shared.exceptions import McpError
 
 LIST_PAGE_SIZE = 25
+MAX_SSE_EVENT_SIZE = 64 * 1024 * 1024  # bytes; mcp 2.x only
 SEARCH_RESULT_LIMIT = 5
 
 MCP_APPS_EXTENSION = "io.modelcontextprotocol/ui"
@@ -278,9 +279,10 @@ async def _open_transport(stack: AsyncExitStack, url: str, headers: dict | None)
         client = await stack.enter_async_context(create_mcp_http_client(headers=headers))
         kwargs = {}
         if "max_sse_event_size" in inspect.signature(streamable_http_client).parameters:
-            # mcp 2.x caps one server-sent event at 1 MiB by default; a PDF or image
-            # returned by a tool is one event and is larger. 1.x had no cap.
-            kwargs["max_sse_event_size"] = None
+            # mcp 2.x caps one server-sent event at 1 MiB by default. An MCP App's HTML
+            # (resources/read, one event; a PDF viewer with pdf.js inlined is ~4 MiB) and
+            # tool results that carry images are larger. mcp 1.x had no cap.
+            kwargs["max_sse_event_size"] = MAX_SSE_EVENT_SIZE
         streams = await stack.enter_async_context(
             streamable_http_client(url, http_client=client, **kwargs)
         )
