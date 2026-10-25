@@ -10,6 +10,7 @@ description: Wraps MCP server tools and renders MCP App UI resources (ui://) as 
 
 import base64
 import hashlib
+import inspect
 import json
 import logging
 import secrets
@@ -24,8 +25,11 @@ from starlette.routing import Route
 
 from mcp import types
 from mcp.client.session import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
-from mcp.shared.exceptions import McpError
+
+try:  # mcp 2.x
+    from mcp.shared.exceptions import MCPError as McpError
+except ImportError:  # mcp 1.x
+    from mcp.shared.exceptions import McpError
 
 LIST_PAGE_SIZE = 25
 SEARCH_RESULT_LIMIT = 5
@@ -48,6 +52,12 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _field(obj, snake: str, camel: str):
+    """A result field by name: mcp 2.x models use snake_case, 1.x camelCase."""
+    value = getattr(obj, snake, None)
+    return value if value is not None else getattr(obj, camel, None)
 
 
 def _to_dict(obj) -> dict:
@@ -230,33 +240,58 @@ async def _list_all_tools(session: ClientSession) -> list:
             params=types.PaginatedRequestParams(cursor=cursor)
         )
         tools.extend(result.tools)
-        cursor = result.nextCursor
+        cursor = _field(result, "next_cursor", "nextCursor")
         if not cursor:
             return tools
 
 
+_APPS_EXTENSION = {MCP_APPS_EXTENSION: {"mimeTypes": [MCP_APPS_MIME_TYPE]}}
+# mcp 2.x takes the advertised extensions as a ClientSession argument; 1.x has no such argument.
+_SESSION_TAKES_EXTENSIONS = "extensions" in inspect.signature(ClientSession.__init__).parameters
+
+
 class _AppsClientSession(ClientSession):
-    """ClientSession that advertises MCP Apps support when it initializes."""
+    """ClientSession that advertises MCP Apps support when it initializes (mcp 1.x)."""
 
     async def send_request(self, request, *args, **kwargs):
         if isinstance(request.root, types.InitializeRequest):
-            request.root.params.capabilities.extensions = {
-                MCP_APPS_EXTENSION: {"mimeTypes": [MCP_APPS_MIME_TYPE]}
-            }
+            request.root.params.capabilities.extensions = _APPS_EXTENSION
         return await super().send_request(request, *args, **kwargs)
+
+
+async def _open_transport(stack: AsyncExitStack, url: str, headers: dict | None):
+    """Open the streamable-HTTP transport and return its (read, write) streams.
+
+    mcp 2.x and recent 1.x take a configured HTTP client (``streamable_http_client``);
+    1.x before that took ``headers=`` (``streamablehttp_client``). Older 1.x yields
+    three values, 2.x two.
+    """
+    try:
+        from mcp.client.streamable_http import streamable_http_client
+    except ImportError:
+        from mcp.client.streamable_http import streamablehttp_client
+
+        streams = await stack.enter_async_context(streamablehttp_client(url, headers=headers))
+    else:
+        from mcp.shared._httpx_utils import create_mcp_http_client
+
+        client = await stack.enter_async_context(create_mcp_http_client(headers=headers))
+        streams = await stack.enter_async_context(
+            streamable_http_client(url, http_client=client)
+        )
+    return streams[0], streams[1]
 
 
 async def _connect_mcp(url: str, headers: dict | None) -> tuple[AsyncExitStack, ClientSession]:
     """Open a streamable-HTTP MCP connection. Caller owns the returned stack."""
     stack = AsyncExitStack()
     try:
-        transport = await stack.enter_async_context(
-            streamablehttp_client(url, headers=headers)
-        )
-        read_stream, write_stream, _ = transport
-        session = await stack.enter_async_context(
-            _AppsClientSession(read_stream, write_stream)
-        )
+        read_stream, write_stream = await _open_transport(stack, url, headers)
+        if _SESSION_TAKES_EXTENSIONS:
+            session = ClientSession(read_stream, write_stream, extensions=_APPS_EXTENSION)
+        else:
+            session = _AppsClientSession(read_stream, write_stream)
+        session = await stack.enter_async_context(session)
         await session.initialize()
         return stack, session
     except Exception:
@@ -987,7 +1022,7 @@ class Tools:
                     "name": tool.name,
                     "description": tool.description or "",
                     "has_ui": _extract_ui_resource_uri(tool) is not None,
-                    "parameters": tool.inputSchema,
+                    "parameters": _field(tool, "input_schema", "inputSchema"),
                 }
                 for _, tool in scored[:SEARCH_RESULT_LIMIT]
             ]
