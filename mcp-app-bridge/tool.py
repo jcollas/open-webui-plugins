@@ -276,8 +276,13 @@ async def _open_transport(stack: AsyncExitStack, url: str, headers: dict | None)
         from mcp.shared._httpx_utils import create_mcp_http_client
 
         client = await stack.enter_async_context(create_mcp_http_client(headers=headers))
+        kwargs = {}
+        if "max_sse_event_size" in inspect.signature(streamable_http_client).parameters:
+            # mcp 2.x caps one server-sent event at 1 MiB by default; a PDF or image
+            # returned by a tool is one event and is larger. 1.x had no cap.
+            kwargs["max_sse_event_size"] = None
         streams = await stack.enter_async_context(
-            streamable_http_client(url, http_client=client)
+            streamable_http_client(url, http_client=client, **kwargs)
         )
     return streams[0], streams[1]
 
